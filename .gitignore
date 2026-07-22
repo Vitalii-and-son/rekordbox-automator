@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Telethon login session — contains YOUR authenticated Telegram session. Never commit.
+*.session
+*.session-journal
+
+# Secrets (TG_API_ID / TG_API_HASH etc. if you switch to a dotenv loader)
+.env
+.env.local
+
+# Downloaded songs, if you point TG_DOWNLOAD_DIR inside the repo
+/TelegramSongs/

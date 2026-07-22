@@ -1,0 +1,3 @@
+# One Spotify link per line. Lines starting with # are ignored.
+# Example:
+# https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT
