@@ -29,6 +29,26 @@ from pathlib import Path
 
 from telethon import TelegramClient, events
 
+
+def _load_dotenv():
+    """Load KEY=VALUE lines from a local .env next to this script (if present).
+
+    Keeps secrets (api_hash etc.) out of this tracked file. Real environment
+    variables take precedence over .env values.
+    """
+    env_path = Path(__file__).with_name(".env")
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
+_load_dotenv()
+
 # =====================================================================
 # CONFIG  -- edit these, or set the matching TG_* environment variables
 # =====================================================================
@@ -58,6 +78,7 @@ AUTO_CLICK_FIRST_BUTTON = True
 # --- Timing -------------------------------------------------------------------
 IDLE_TIMEOUT = int(os.environ.get("TG_IDLE_TIMEOUT", "45"))       # wait per next msg
 OVERALL_TIMEOUT = int(os.environ.get("TG_OVERALL_TIMEOUT", "300"))  # hard cap per link
+HISTORY_LIMIT = int(os.environ.get("TG_HISTORY_LIMIT", "200"))     # --history: msgs to scan
 
 # --- Destination program (GUI automation) -------------------------------------
 # The window title is matched as a substring, e.g. "rekordbox", "Serato",
@@ -69,13 +90,14 @@ PROGRAM_EXE = os.environ.get("TG_PROGRAM_EXE", "")               # optional
 IMPORT_HOTKEY = tuple(os.environ.get("TG_IMPORT_HOTKEY", "ctrl,o").split(","))
 
 AUDIO_EXTS = (".mp3", ".flac", ".m4a", ".wav", ".ogg", ".opus", ".aac")
+ARCHIVE_EXTS = (".zip", ".rar", ".7z")   # playlist downloads often arrive zipped
 
 # =====================================================================
 # Telegram side
 # =====================================================================
 
-def is_audio_message(msg) -> bool:
-    """True if this bot message carries a song we should download."""
+def is_wanted_media(msg) -> bool:
+    """True if this bot message carries a song (or an archive of songs) to save."""
     if getattr(msg, "audio", None) or getattr(msg, "voice", None):
         return True
     doc = getattr(msg, "document", None)
@@ -84,39 +106,104 @@ def is_audio_message(msg) -> bool:
             return True
         for attr in doc.attributes:
             name = getattr(attr, "file_name", "") or ""
-            if name.lower().endswith(AUDIO_EXTS):
+            if name.lower().endswith(AUDIO_EXTS + ARCHIVE_EXTS):
                 return True
     return False
 
 
-async def maybe_click_button(msg, pattern: str) -> bool:
-    """Click the best-matching inline button on a message. Returns True if clicked."""
+def wanted_target(msg):
+    """Return (destination Path, expected size) for a media message, else (None, None).
+
+    Lets us skip files already fully downloaded, so re-runs resume instead of
+    re-fetching everything. A size mismatch means a partial file -> re-download.
+    """
+    doc = getattr(msg, "document", None)
+    if doc:
+        size = getattr(doc, "size", None)
+        for attr in doc.attributes:
+            name = getattr(attr, "file_name", None)
+            if name:
+                return DOWNLOAD_DIR / name, size
+    return None, None
+
+
+def new_results():
+    """Fresh accumulator for a run's download outcomes."""
+    return {"files": [], "downloaded": [], "skipped": [], "failed": []}
+
+
+async def download_one(client, msg, results):
+    """Download one song/archive message; record the outcome in `results`.
+
+    Skips a file we already have whole, re-fetches partial files, and never lets
+    one failed download abort the whole batch.
+    """
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    target, expected = wanted_target(msg)
+    name = target.name if target else f"message {msg.id}"
+
+    if target and expected and target.exists() and target.stat().st_size == expected:
+        print(f"    skip (already have): {name}")
+        results["skipped"].append(name)
+        results["files"].append(target)
+        return
+
+    dest = str(target) if target else str(DOWNLOAD_DIR) + os.sep
+    try:
+        path = await client.download_media(msg, file=dest)
+    except Exception as e:
+        print(f"    [!] FAILED: {name}  ({e})")
+        results["failed"].append((name, str(e)))
+        return
+
+    if path:
+        print(f"    downloaded: {Path(path).name}")
+        results["downloaded"].append(Path(path).name)
+        results["files"].append(Path(path))
+    else:
+        print(f"    [!] FAILED (nothing returned): {name}")
+        results["failed"].append((name, "no file returned"))
+
+
+async def maybe_click_button(msg, pattern: str, already_clicked: set):
+    """Click the best not-yet-clicked callback button. Returns its text, or None.
+
+    URL buttons are ignored (we only want to trigger the bot's callbacks).
+    Tracking by (msg.id, text) handles multi-step flows where the bot edits one
+    message from format buttons -> a 'Start Download' button.
+    """
     if not msg.buttons:
-        return False
-    buttons = [b for row in msg.buttons for b in row]
+        return None
+    candidates = [
+        b for row in msg.buttons for b in row
+        if getattr(b, "text", None)
+        and not getattr(b, "url", None)
+        and (msg.id, b.text) not in already_clicked
+    ]
+    if not candidates:
+        return None
     target = None
     if pattern:
         rx = re.compile(pattern, re.I)
-        target = next((b for b in buttons if b.text and rx.search(b.text)), None)
+        target = next((b for b in candidates if rx.search(b.text)), None)
     if target is None and AUTO_CLICK_FIRST_BUTTON:
-        target = buttons[0]
+        target = candidates[0]
     if target is None:
-        return False
+        return None
     print(f"    clicking button: {target.text!r}")
     try:
         await target.click()
-        return True
+        return target.text
     except Exception as e:
         print(f"    [!] button click failed: {e}")
-        return False
+        return None
 
 
-async def grab_song(client: TelegramClient, bot, url: str):
+async def grab_song(client: TelegramClient, bot, url: str, results):
     """Send one link, handle buttons, download whatever audio the bot returns."""
-    downloaded = []
     queue: asyncio.Queue = asyncio.Queue()
-    seen = set()          # (msg id, edit_date) already processed
-    clicked_msgs = set()  # msg ids whose buttons we've already clicked
+    seen = set()             # (msg id, edit_date) states already processed
+    clicked_buttons = set()  # (msg id, button text) we've already clicked
 
     async def handler(event):
         await queue.put(event.message)
@@ -142,21 +229,28 @@ async def grab_song(client: TelegramClient, bot, url: str):
                 continue
             seen.add(key)
 
-            if is_audio_message(msg):
-                DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-                path = await client.download_media(msg, file=str(DOWNLOAD_DIR) + os.sep)
-                if path:
-                    print(f"    downloaded: {path}")
-                    downloaded.append(Path(path))
-            elif msg.buttons and msg.id not in clicked_msgs:
-                if await maybe_click_button(msg, BUTTON_MATCH):
-                    clicked_msgs.add(msg.id)
-            elif msg.message:
+            if is_wanted_media(msg):
+                await download_one(client, msg, results)
+                continue
+
+            clicked_text = None
+            if msg.buttons:
+                clicked_text = await maybe_click_button(msg, BUTTON_MATCH, clicked_buttons)
+                if clicked_text is not None:
+                    clicked_buttons.add((msg.id, clicked_text))
+
+            if clicked_text is None and msg.message:
                 print(f"    bot: {msg.message[:100]}")
     finally:
         client.remove_event_handler(handler)
 
-    return downloaded
+
+async def grab_history(client, bot, limit, results):
+    """Download files the bot has ALREADY sent into the chat (no re-triggering)."""
+    print(f"Scanning the last {limit} messages from the bot for songs ...")
+    async for msg in client.iter_messages(bot, limit=limit):
+        if is_wanted_media(msg):
+            await download_one(client, msg, results)
 
 
 # =====================================================================
@@ -234,8 +328,9 @@ def import_into_program(file_path: Path):
 # =====================================================================
 
 def get_links():
-    if len(sys.argv) > 1:
-        return sys.argv[1:]
+    cli = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if cli:
+        return cli
     lf = Path("links.txt")
     if lf.exists():
         return [
@@ -260,10 +355,50 @@ def check_config():
     return not problems
 
 
+def print_report(results):
+    """Print an end-of-run summary and save it next to the songs."""
+    downloaded, skipped, failed = results["downloaded"], results["skipped"], results["failed"]
+    all_names = downloaded + skipped + [n for n, _ in failed]
+    unique = sorted(set(all_names))
+    dupes = len(all_names) - len(unique)
+
+    lines = [
+        "",
+        "==================== DOWNLOAD REPORT ====================",
+        f"  Tracks seen         : {len(all_names)}",
+        f"    downloaded now    : {len(downloaded)}",
+        f"    already had       : {len(skipped)}",
+        f"    failed            : {len(failed)}",
+        f"  Unique tracks       : {len(unique)}",
+    ]
+    if dupes:
+        lines.append(f"  Duplicate sends     : {dupes}")
+    lines.append(f"  Folder              : {DOWNLOAD_DIR}")
+    if failed:
+        lines.append("")
+        lines.append("  FAILED (rerun the same command to retry just these):")
+        for n, err in failed:
+            lines.append(f"    - {n}  ({err})")
+    lines.append("========================================================")
+    report = "\n".join(lines)
+    print(report)
+
+    try:
+        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        report_path = DOWNLOAD_DIR / "_download_report.txt"
+        full = report + "\n\nAll tracks:\n" + "\n".join(f"  {n}" for n in unique) + "\n"
+        report_path.write_text(full, encoding="utf-8")
+        print(f"  (full report saved to {report_path})")
+    except Exception as e:
+        print(f"  [!] could not save report file: {e}")
+
+
 async def main():
-    links = get_links()
-    if not links:
-        print("No Spotify links given. Pass them as arguments or put them in links.txt.")
+    history_mode = "--history" in sys.argv
+    links = [] if history_mode else get_links()
+    if not history_mode and not links:
+        print("No links given. Pass them as arguments, put them in links.txt,")
+        print("or use  --history  to grab files the bot has already sent.")
         return
     if not check_config():
         print("Fix the items above, then rerun.")
@@ -273,17 +408,19 @@ async def main():
     await client.start()  # first run: prompts for phone + code
     bot = await client.get_entity(BOT_USERNAME)
 
-    all_files = []
-    for url in links:
-        print(f"\n=== {url} ===")
-        files = await grab_song(client, bot, url)
-        if files:
-            all_files.extend(files)
-        else:
-            print("    no audio received (check the bot / button match).")
+    results = new_results()
+    if history_mode:
+        await grab_history(client, bot, HISTORY_LIMIT, results)
+    else:
+        for url in links:
+            print(f"\n=== {url} ===")
+            await grab_song(client, bot, url, results)
 
     await client.disconnect()
 
+    print_report(results)
+
+    all_files = results["files"]
     if not all_files:
         print("\nNothing downloaded.")
         return
@@ -294,9 +431,7 @@ async def main():
         for f in all_files:
             import_into_program(f)
     else:
-        print("\nDownloaded (set TG_PROGRAM_TITLE to auto-import these):")
-        for f in all_files:
-            print("  ", f)
+        print("\n(set TG_PROGRAM_TITLE to auto-import these into rekordbox)")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python -m pip install -r requirements.txt)",
+      "Bash(python -c \"import telethon; print\\('telethon OK', telethon.__version__\\)\")",
+      "Bash(python -m py_compile tg_music_grabber.py)",
+      "Read(//c/Users/PC/Music/TelegramSongs/**)",
+      "Read(//c/Users/PC/**)",
+      "Bash(python -c \"import cryptg; print\\('cryptg', cryptg.__version__, '-> fast'\\)\")",
+      "Bash(python -c \"import pyaes; print\\('pyaes present \\(slow AES in use if cryptg missing\\)'\\)\")",
+      "Bash(python -m pip install cryptg)",
+      "Bash(python -c \"import cryptg; print\\('cryptg', cryptg.__version__, 'installed -> fast downloads'\\)\")",
+      "Bash(python -c \"import cryptg; from cryptg import encrypt_ige, decrypt_ige; print\\('cryptg OK -> Telethon will use fast C-based AES'\\)\")"
+    ]
+  }
+}
